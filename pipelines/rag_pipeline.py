@@ -1,0 +1,412 @@
+# rag_pipeline.py
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional
+
+import tree_sitter_python as tspython
+from datasets import load_dataset
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from llama_index.core.node_parser import CodeSplitter
+from tqdm import tqdm
+from tree_sitter import Language, Parser
+
+from ragent.git.repository import get_project_structure_from_scratch
+from ragent.util.preprocess_data import filter_none_python, filter_out_test_files
+
+DATA_DIR = Path("./swebench_data")
+REPO_ROOT = Path("./repo_data")
+CHROMA_ROOT = Path("chroma_data")
+
+EMBED_MODEL = "nomic-ai/nomic-embed-text-v1"
+LLM_MODEL = "gpt-oss:120b"
+EMBED_MODEL_KWARGS = {"device": "cuda", "trust_remote_code": True}
+ENCODE_KWARGS = {"normalize_embeddings": False}
+INCLUDE_PATH_IN_CHUNK = False
+
+SPLIT_CHUNK_LINES = 35
+SPLIT_OVERLAP = 5
+
+
+def _is_python_path(path: str) -> bool:
+    return str(path).endswith(".py")
+
+
+def _get_splitter(splitter_type: str):
+    if splitter_type == "code":
+        PY_LANGUAGE = Language(tspython.language())
+        PARSER = Parser(PY_LANGUAGE)
+
+        print("[_get_splitter] using code splitter")
+
+        return CodeSplitter(
+            language="python",
+            parser=PARSER,
+            chunk_lines=SPLIT_CHUNK_LINES,
+            chunk_lines_overlap=SPLIT_OVERLAP,
+            include_metadata=True,
+        )
+    elif splitter_type == "text":
+        print("[_get_splitter] using text splitter")
+        return RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=32)
+    else:
+        raise ValueError(f"Unknown splitter type: {splitter_type}")
+
+
+def collect_code_nodes(
+    node: object, path_parts: List[str], repo_name: str
+) -> List[Document]:
+    documents: List[Document] = []
+    relative_path = os.path.join(*path_parts)
+    is_python = _is_python_path(relative_path)
+
+    if is_python and isinstance(node, dict):
+        try:
+            code = "\n".join(node.get("text", []))
+            meta = {
+                "repo": repo_name,
+                "file": relative_path,
+                "relative_path": os.path.join(repo_name, relative_path),
+                "type": "file",
+            }
+            documents.append(Document(page_content=code, metadata=meta))
+        except Exception as e:
+            print(
+                f"[collect_code_nodes] error reading {relative_path} in {repo_name}: {e}"
+            )
+    elif isinstance(node, dict):
+        for key, subnode in node.items():
+            documents.extend(collect_code_nodes(subnode, path_parts + [key], repo_name))
+    return documents
+
+
+def load_documents_from_json(json_path: Path) -> List[Document]:
+    with json_path.open("r") as f:
+        data = json.load(f)
+    all_docs: List[Document] = []
+    for repo_name, repo_content in data.items():
+        all_docs.extend(collect_code_nodes(repo_content, [""], repo_name))
+    return all_docs
+
+
+# ---------------------------
+# Embedding Model
+# ---------------------------
+def make_embed_model(
+    model_name: str = EMBED_MODEL,
+    model_kwargs: dict = EMBED_MODEL_KWARGS,
+    encode_kwargs: dict = ENCODE_KWARGS,
+):
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        encode_kwargs=encode_kwargs,
+        show_progress=True,
+    )
+
+
+# ---------------------------
+# Indexing / Vector-store
+# ---------------------------
+def ensure_repo_json(
+    swe_entry: dict,
+    index: int,
+    data_dir: Path = DATA_DIR,
+    repo_root: Path = REPO_ROOT,
+) -> Path:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    json_name = f"swebench_{index}_py.json"
+    json_path = data_dir / json_name
+    if not json_path.exists():
+        project_structure = get_project_structure_from_scratch(
+            swe_entry["repo"],
+            swe_entry["base_commit"],
+            swe_entry["instance_id"],
+            str(repo_root),
+            cleanup=True,
+        )
+        structure = project_structure["structure"]
+        filter_none_python(structure)
+        filter_out_test_files(structure)
+        with json_path.open("w") as f:
+            json.dump(structure, f, indent=2)
+    return json_path
+
+
+def split_documents(docs: Iterable[Document], splitter) -> List[Document]:
+    output: List[Document] = []
+
+    if isinstance(splitter, RecursiveCharacterTextSplitter):
+        return splitter.split_documents(docs)
+
+    for doc in docs:
+        try:
+            chunks = splitter.split_text(doc.page_content)
+            file_path = doc.metadata.get("relative_path", "")
+            for idx, chunk in enumerate(chunks):
+                if INCLUDE_PATH_IN_CHUNK:
+                    content = f"[PATH] {file_path}\n[CODE]\n{chunk}"
+                else:
+                    content = chunk
+                meta = {**doc.metadata, "split_index": idx}
+                output.append(Document(page_content=content, metadata=meta))
+        except Exception as e:
+            print(
+                f"[split_documents] failed to split {doc.metadata.get('relative_path','')}: {e}"
+            )
+    return output
+
+
+def build_chroma_from_documents(
+    documents: List[Document], chroma_dir: Path, embed_model
+) -> Chroma:
+    chroma_dir.mkdir(parents=True, exist_ok=True)
+    vect = Chroma.from_documents(
+        documents=documents,
+        embedding=embed_model,
+        persist_directory=str(chroma_dir),
+    )
+    vect.persist()
+    return vect
+
+
+def load_or_build_vector_store(
+    swe_entry: dict,
+    index: int,
+    embed_model,
+    splitter,
+    data_dir: Path = DATA_DIR,
+    chroma_root: Path = CHROMA_ROOT,
+) -> Chroma:
+    repo_json = ensure_repo_json(swe_entry, index, data_dir)
+    docs = load_documents_from_json(repo_json)
+    chroma_dir = chroma_root / f"chroma_repo_index_swe_data{index}"
+
+    if chroma_dir.exists():
+        print(f"[load_or_build_vector_store] loading existing Chroma: {chroma_dir}")
+        return Chroma(embedding_function=embed_model, persist_directory=str(chroma_dir))
+
+    print("[load_or_build_vector_store] splitting and building vector store...")
+    split_docs = split_documents(docs, splitter)
+    print(f"[load_or_build_vector_store] split into {len(split_docs)} chunks")
+    return build_chroma_from_documents(split_docs, chroma_dir, embed_model)
+
+
+# ---------------------------
+# Retrieval Helpers
+# ---------------------------
+def get_retriever_from_store(store: Chroma, k: int = 50):
+    return store.as_retriever(search_kwargs={"k": k})
+
+
+# ---------------------------
+# RAG reasoning (rank relevant files)
+# ---------------------------
+def rag_rank_files(
+    llm: Callable[[str], str], question: str, context_docs: List[Document]
+) -> List[str]:
+    """
+    Use an LLM to analyze retrieved code snippets and rank files
+    most likely related to the described bug.
+    """
+    context = "\n\n---\n\n".join(
+        [
+            f"[FILE] {d.metadata.get('relative_path', '')}\n{d.page_content[:2000]}"
+            for d in context_docs[:15]
+        ]
+    )
+    prompt = f"""
+You are an expert software debugging assistant.
+
+Your goal: Identify which retrieved files are most likely to contain the bug described below.
+
+Bug Report:
+{question}
+
+Code Context:
+{context}
+
+Instructions:
+1. Carefully analyze the bug report and snippets.
+2. Respond ONLY with a JSON array of file paths, ordered from most to least relevant.
+3. If there is no path provided, return an empty JSON array.
+4. DO NOT include any explanations or additional text.
+5. Return 10 ranked file paths from the context.
+6. DO NOT include paths that were not provided.
+
+Example:
+["src/core/utils.py", "src/main/model.py", "src/data/loader.py"]
+"""
+
+    raw_response = llm(prompt)
+    try:
+        ranked_files = json.loads(raw_response)
+        if isinstance(ranked_files, list) and all(
+            isinstance(x, str) for x in ranked_files
+        ):
+            return ranked_files
+        return []
+    except Exception:
+        return []
+
+
+def process_single_example(
+    swebench_entry: dict,
+    index: int,
+    splitter,
+    embed_model=None,
+    use_rag: bool = False,
+    llm: Optional[Callable[[str], str]] = None,
+    k: int = 50,
+) -> Dict:
+    if embed_model is None:
+        embed_model = make_embed_model()
+
+    vector_store = load_or_build_vector_store(
+        swebench_entry, index, embed_model, splitter
+    )
+    # Excluding time taken to encode
+    start_time = time.time()
+
+    retriever = get_retriever_from_store(vector_store, k=k)
+
+    problem_statement = swebench_entry.get("problem_statement", "")
+    patch = swebench_entry.get("patch", "")
+
+    retrieved_docs = retriever.get_relevant_documents(problem_statement)
+    retrieved_paths = []
+    for d in retrieved_docs:
+        print(d)
+        retrieved_paths.append(d.metadata.get("relative_path", ""))
+
+    seen = set()
+    retrieved_paths = [p for p in retrieved_paths if not (p in seen or seen.add(p))]
+
+    result = {
+        "swe_data_index": index,
+        "problem_statement": problem_statement,
+        "patch": patch,
+        "retrieved_files": retrieved_paths,
+    }
+
+    if use_rag and llm is not None:
+        try:
+            ranked_files = rag_rank_files(llm, problem_statement, retrieved_docs)
+            result["rag_ranked_files"] = ranked_files
+        except Exception as e:
+            result["rag_error"] = str(e)
+
+    time_taken = time.time() - start_time
+    result["time_taken_seconds"] = time_taken
+
+    return result
+
+
+def run_dataset(
+    split: str,
+    splitter,
+    persist_results: Path,
+    dataset_name: str = "princeton-nlp/SWE-bench_Lite",
+    start: int = 0,
+    end: Optional[int] = None,
+    use_rag: bool = False,
+    llm: Optional[Callable[[str], str]] = None,
+    skip_existing: bool = True,
+):
+    swebench = load_dataset(dataset_name, split=split)
+    n = len(swebench) if end is None else min(end, len(swebench))
+    all_results = []
+    processed = set()
+
+    if skip_existing:
+        if persist_results.exists():
+            with persist_results.open("r") as f:
+                all_results = json.load(f)
+                processed = {r["swe_data_index"] for r in all_results}
+
+    embed_model = make_embed_model()
+
+    for i in tqdm(range(start, n), desc="Processing SWE data"):
+        if i in processed:
+            continue
+        swe_entry = swebench[i]
+        res = process_single_example(
+            swe_entry, i, splitter, embed_model=embed_model, use_rag=use_rag, llm=llm
+        )
+
+        all_results.append(res)
+        with persist_results.open("w") as f:
+            json.dump(all_results, f, indent=2)
+
+
+def ollama_ranker(prompt: str) -> str:
+    import requests
+
+    response = requests.post(
+        os.environ["OLLAMA_HOST"] + "/api/generate",
+        json={"model": LLM_MODEL, "prompt": prompt, "stream": False},
+    )
+    data = response.json()
+    return data.get("response", "").strip()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--splitter",
+        type=str,
+        default="code",
+        choices=["code", "text"],
+        help="Type of text splitter to use.",
+    )
+    parser.add_argument(
+        "--use_rag",
+        action="store_true",
+        help="Whether to use RAG (Retrieval-Augmented Generation).",
+    )
+    parser.add_argument(
+        "--include_path_in_chunk",
+        action="store_true",
+        help="Whether to include file path in each text chunk.",
+    )
+    parser.add_argument(
+        "--llm",
+        type=str,
+        help="LLM function to use for ranking.",
+    )
+    parser.add_argument(
+        "--results_path",
+        type=str,
+        default="./retrieval_results/ranking_results.json",
+        help="Path to persist retrieval results.",
+    )
+
+    args = parser.parse_args()
+
+    if args.include_path_in_chunk:
+        print("[main] including file path in each text chunk")
+        INCLUDE_PATH_IN_CHUNK = True
+
+    if args.llm:
+        print(f"[main] using LLM model: {args.llm}")
+        LLM_MODEL = args.llm
+
+    persist_results = Path(args.results_path)
+
+    splitter = args.splitter
+    run_dataset(
+        split="test",
+        splitter=_get_splitter(splitter),
+        persist_results=persist_results,
+        dataset_name="princeton-nlp/SWE-bench_Lite",
+        start=0,
+        end=None,
+        use_rag=args.use_rag,
+        llm=ollama_ranker,
+        skip_existing=True,
+    )
