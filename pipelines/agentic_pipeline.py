@@ -1,9 +1,6 @@
 import argparse
 import json
-import sys
 import time
-
-from datasets import load_dataset
 
 from ragent.agent.ranker_agent import SWEBenchRankerAgent
 
@@ -19,6 +16,19 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--input_file",
+        type=str,
+        help="Path to the input JSON file with Query transformation pipeline results.",
+    )
+
+    parser.add_argument(
+        "--results_file",
+        type=str,
+        default="retrieval_results/agentoic_ranked_results.json",
+        help="Path to store ranked results.",
+    )
+
+    parser.add_argument(
         "--llm",
         type=str,
         default="gpt-oss:120b",
@@ -26,17 +36,13 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
-    RESULTS_FILE = f"/local/home/amamun/projects/rag_fix/paper_results/agentic_time_test_full_code_{args.llm.replace(':', '_')}_ranked_results_t{args.temperature}.json"
+    input_file = args.input_file
+    RESULTS_FILE = args.results_file
 
     print("Results will be stored in:", RESULTS_FILE)
     # Load retrieval results (contains swe_data_index and other fields)
-    with open(
-        "/local/home/amamun/projects/rag_fix/paper_results/agentic_gpt-oss_120b_temp_0.7_ranked_results.json",
-        "r",
-    ) as f:
+    with open(input_file, "r") as f:
         all_retrieved_docs = json.load(f)
-        all_retrieved_docs = all_retrieved_docs[:10]
 
     # Try loading existing results so we can resume
     try:
@@ -69,7 +75,6 @@ if __name__ == "__main__":
         while attempt < MAX_RETRIES:
             attempt += 1
             try:
-                start_time = time.time()
                 print(f"Attempt {attempt} for index {swe_index}...")
                 ranker = SWEBenchRankerAgent(
                     repo_content=repo_content,
@@ -78,15 +83,10 @@ if __name__ == "__main__":
                     temperature=args.temperature,
                 )
                 scores = ranker.run()
-                time_taken = time.time() - start_time
-                print(f"Time taken: {time_taken:.2f} seconds")
                 if isinstance(scores, dict) and scores:
                     break
             except Exception as e:
-                time_taken = time.time() - start_time
                 print(f"Error in attempt {attempt} for index {swe_index}: {e}")
-                print(f"Time taken before error: {time_taken:.2f} seconds")
-                exit()
             time.sleep(2)  # small delay between retries
 
         # Save results if successful
@@ -94,7 +94,6 @@ if __name__ == "__main__":
             result_entry = {
                 **entry,  # keep all original SWE-bench + retrieval data
                 "ranked_scores": scores,
-                "time_taken_seconds": time_taken,
             }
             all_results.append(result_entry)
 
