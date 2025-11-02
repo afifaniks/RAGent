@@ -28,6 +28,11 @@ Install dependencies
 pip install -r requirements.txt
 ```
 
+### APR Setup
+To setup Agentless, you can either follow their official documentation where they use proprietary LLM like GPT-4o: https://github.com/OpenAutoCoder/Agentless/blob/main/README_swebench.md
+
+Or, if you want to use it with Ollama, you can use our ported version of Agentless. The instruction is provided later in this documentation.
+
 ## Preprocessing
 For faster processing, we process SWE-bench-Lite dataset into json files. This can be done by running:
 
@@ -128,3 +133,11 @@ Similarly, evaluation can be ran for new results by updating the ranking_evaluat
 },
 ```
 
+# Repair with Agentless
+First, we have to convert the RAGent file-level localization output to suitable Agentless input file in `jsonl` format. For example, if we want to use our previous result file [localization_results/agentic_gpt-oss_120b_temp_0.7_ranked_results.json](localization_results/agentic_gpt-oss_120b_temp_0.7_ranked_results.json), we can do this:
+
+```bash
+python preprocess/convert_agentless.py --ragent_output localization_results/agentic_gpt-oss_120b_temp_0.7_ranked_results.json --converted_output ragent_locs.jsonl
+```
+
+This will produce `ragent_locs.jsonl` file which is compatible to use in Agentless.
