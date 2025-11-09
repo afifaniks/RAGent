@@ -202,3 +202,4 @@ scripts/out/*
 workspace/*
 .vscode/launch.json
 chroma_paper/*
+checkpoints/*
