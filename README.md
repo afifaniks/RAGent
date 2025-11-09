@@ -141,3 +141,46 @@ python preprocess/convert_agentless.py --ragent_output localization_results/agen
 ```
 
 This will produce `ragent_locs.jsonl` file which is compatible to use in Agentless.
+
+From this stage on https://github.com/OpenAutoCoder/Agentless/blob/main/README_swebench.md, we can follow the Agentless documentation to run the APR specifically from [2. localize to related elements](https://github.com/OpenAutoCoder/Agentless/blob/main/README_swebench.md#2-localize-to-related-elements) stage. However, since our ported Agentless uses Ollama as a backend, we just have to change the LLM and backend whenever an LLM is required to complete an agentless stage.
+
+For example, to localize at the function level using `ragent_locs.jsonl` and with the Ollama-ported Agentless, we can use this:
+
+```bash
+python agentless/fl/localize.py --related_level \
+                                --output_folder results/swe-bench-lite/related_elements_gpt_oss \
+                                --top_n 3 \
+                                --compress_assign \
+                                --compress \
+                                --start_file {DIRECTORY}/ragent_locs.jsonl \                                
+                                --num_threads 10 \
+                                --model gpt-oss:120b \
+                                --backend ollama \
+```                                
+
+The last two parameters `(--model and --backend)` are particularly important to enable ollama, otherwise the framework will use its default LLM GPT-4o.
+
+Similarly, for all subsequent steps should follow the official Agentless documentation along with the mentioned parameters.
+
+## Patch Evaluation
+Once patches are generated, they can be evaluated using swebench library. We recommend creating a new environment with [swebench 4+ (latest)](https://pypi.org/project/swebench/) as swebench 2.1 used by Agentless is now outdated and we ran into many problems to evaluate with it. The run command is simple:
+
+```bash
+python -m swebench.harness.run_evaluation \
+    --dataset_name princeton-nlp/SWE-bench_Lite \
+    --predictions_path repair_results/run_1/ragent/patches/ragent_majority_voting_and_regression_and_reproduction.jsonl \
+    --max_workers 10 \
+    --run_id ragent_evaluation
+```
+Due to the limit to github file size, we provide only the final generated patches on swebench using ragent localization here: [repair_results/run_1/ragent/patches/ragent_majority_voting_and_regression_and_reproduction.jsonl](repair_results/run_1/ragent/patches/ragent_majority_voting_and_regression_and_reproduction.jsonl). 
+
+However, all the intermediate files/outputs using both agentless localization and ragent can be downloaded and evaluated from here: https://drive.google.com/file/d/162p85cxYgGXB2szqkvjwP4CBh7RDuyq2/view?usp=sharing
+
+## Additional Materials
+
+We also provide additional materials like scripts to generate results/diagrams/notebooks under [evaluation/](evaluation/) directory.
+
+For example, [evaluation/analysis.py](evaluation/analysis.py) analyzes how many unique repairs produced by each method fail in the other method due to incorrect localization. Similarly, [evaluation/analyze_incorrect_patch_with_correct_loc.ipynb](evaluation/analyze_incorrect_patch_with_correct_loc.ipynb) explores in which stage (e.g., line-level localization, patch generation) of the APR a particular instance fails, etc.
+
+## Acknowledgements
+We thank [Agentless](https://github.com/OpenAutoCoder/Agentless/tree/main) and [CoSIL](https://github.com/ZhonghaoJiang/CoSIL/tree/master) for their work and making it public for others to use.
